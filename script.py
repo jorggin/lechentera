@@ -27,12 +27,12 @@ import pandas as pd
 INTERVAL               = "15m"
 KLINES_LIMIT           = 600
 TOP_N                  = 20
-MAX_WORKERS            = 10
+MAX_WORKERS            = 5
 TP_ATR_MULT            = 1.8
 SL_ATR_MULT            = 1.2
 NEIGHBORS              = 6
 MAX_BARS_BACK          = 200
-FEATURE_COUNT          = 4          # cuántas de las 5 features usar
+FEATURE_COUNT          = 5          # usa las 5 features, incluido momentum
 RISK_PRINT_LAST_TRADES = 5
 SLEEP_BETWEEN_CYCLES   = 15         # segundos
 TRADE_NOTIONAL         = 100        # USD simulados por trade
@@ -45,8 +45,8 @@ session.headers.update({"User-Agent": "Mozilla/5.0"})
 
 RUNNING = True
 
-# Cache {symbol: {last_time, signal_df, trades}}
-# Evita recalcular KNN completo si la última vela no ha cambiado
+# Cache {symbol: {last_time, result}}
+# Evita recalcular KNN completo y evita redescargar 600 velas si no cambia la última vela
 _symbol_cache: Dict[str, dict] = {}
 
 # ─── Signal handler ───────────────────────────────────────────────────────────
@@ -145,6 +145,26 @@ def fetch_klines(symbol: str, interval: str = INTERVAL,
         return df.reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
+
+
+def fetch_latest_completed_open_time(symbol: str, interval: str = INTERVAL) -> Optional[str]:
+    """
+    Consulta mínima para saber si llegó una vela cerrada nueva.
+    Evita descargar KLINES_LIMIT velas cuando el caché sigue vigente.
+    """
+    try:
+        data = http_get(
+            "/fapi/v1/klines",
+            params={"symbol": symbol, "interval": interval, "limit": 2},
+        )
+        now = pd.Timestamp.now(tz="UTC")
+        for row in reversed(data or []):
+            close_time = pd.to_datetime(row[6], unit="ms", utc=True)
+            if close_time <= now:
+                return str(pd.to_datetime(row[0], unit="ms", utc=True))
+        return None
+    except Exception:
+        return None
 
 # ─── Indicadores ─────────────────────────────────────────────────────────────
 def rsi(series: pd.Series, length: int = 14) -> pd.Series:
@@ -428,7 +448,7 @@ def calculate_metrics(trades: List[Trade]) -> dict:
     losses = [t for t in closed if t.pnl_pct <= 0]
     gp     = sum(t.pnl_pct for t in wins)
     gl     = abs(sum(t.pnl_pct for t in losses))
-    pf     = gp / gl if gl > 0 else float("inf")
+    pf     = gp / max(gl, 1e-9)
 
     eq   = float(INITIAL_BALANCE)
     peak = eq
@@ -466,33 +486,30 @@ def format_last_trades(trades: List[Trade]) -> str:
 # ─── Procesamiento por símbolo (con caché) ───────────────────────────────────
 def process_symbol(symbol: str) -> Optional[dict]:
     """
-    FIX RENDIMIENTO:
-    Cachea signal_df y trades por símbolo.
-    Sólo recalcula KNN cuando llega una nueva vela (last_time cambia).
-    En ciclos de 15 s esto evita casi el 100 % de recómputos.
+    Cachea el resultado por símbolo.
+    En cada ciclo sólo consulta una muestra mínima para verificar si llegó una
+    vela cerrada nueva; si no cambió, reutiliza el resultado anterior sin
+    descargar 600 velas ni recalcular KNN.
     """
     global _symbol_cache
     try:
+        cache = _symbol_cache.get(symbol)
+        if cache:
+            last_time = fetch_latest_completed_open_time(symbol)
+            if last_time is None:
+                return cache["result"]
+            if cache.get("last_time") == last_time:
+                return cache["result"]
+
         df = fetch_klines(symbol)
         if df.empty or len(df) < 250:
             return None
 
         last_time = str(df["open_time"].iloc[-1])
-        cache     = _symbol_cache.get(symbol, {})
-
-        if cache.get("last_time") == last_time:
-            signal_df = cache["signal_df"]
-            trades    = cache["trades"]
-        else:
-            signal_df = entry_signals(df)
-            trades    = backtest_tp_sl(signal_df)
-            for t in trades:
-                t.symbol = symbol
-            _symbol_cache[symbol] = dict(
-                last_time = last_time,
-                signal_df = signal_df,
-                trades    = trades,
-            )
+        signal_df = entry_signals(df)
+        trades    = backtest_tp_sl(signal_df)
+        for t in trades:
+            t.symbol = symbol
 
         last    = signal_df.iloc[-1]
         summary = summarize_trades(trades, RISK_PRINT_LAST_TRADES)
@@ -503,7 +520,7 @@ def process_symbol(symbol: str) -> Optional[dict]:
         )
         atr_pct = float(last["atr"] / last["close"] * 100) if float(last["close"]) else 0.0
 
-        return dict(
+        result = dict(
             symbol       = symbol,
             signal       = sig_str,
             price        = float(last["close"]),
@@ -513,10 +530,12 @@ def process_symbol(symbol: str) -> Optional[dict]:
             last_5       = summary["trades"],
             total_trades = summary["metrics"]["n"],
             last_5_text  = format_last_trades(summary["trades"]),
-            all_trades   = trades,
         )
+        _symbol_cache[symbol] = dict(last_time=last_time, result=result)
+        return result
     except Exception as e:
         return dict(symbol=symbol, error=str(e))
+
 
 # ─── Ciclo de escaneo ─────────────────────────────────────────────────────────
 def scan_once(symbols: List[str]) -> List[dict]:
