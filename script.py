@@ -14,6 +14,7 @@ Fixes aplicados:
 import sys
 import time
 import signal
+import threading
 from datetime import datetime
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -38,6 +39,7 @@ SLEEP_BETWEEN_CYCLES   = 15         # segundos
 TRADE_NOTIONAL         = 100        # USD simulados por trade
 INITIAL_BALANCE        = 100
 FEE_RATE               = 0.0006     # 0.06 % por lado (taker)
+INTRABAR_EXIT_POLICY   = "OPEN_DISTANCE"  # OPEN_DISTANCE | CONSERVATIVE
 
 BASE = "https://fapi.binance.com"
 session = requests.Session()
@@ -48,6 +50,7 @@ RUNNING = True
 # Cache {symbol: {last_time, result}}
 # Evita recalcular KNN completo y evita redescargar 600 velas si no cambia la última vela
 _symbol_cache: Dict[str, dict] = {}
+_cache_lock = threading.Lock()
 
 # ─── Signal handler ───────────────────────────────────────────────────────────
 def _handle_sigint(signum, frame):
@@ -150,6 +153,24 @@ def fetch_klines(symbol: str, interval: str = INTERVAL,
 def fetch_latest_completed_open_time(symbol: str, interval: str = INTERVAL) -> Optional[str]:
     """
     Consulta mínima para saber si llegó una vela cerrada nueva.
+    Evita depender del orden de Binance: toma la mayor open_time entre las
+    velas que ya tienen close_time vencido. Los errores HTTP/red se propagan
+    para no ocultar desconexiones usando datos obsoletos del caché.
+    """
+    data = http_get(
+        "/fapi/v1/klines",
+        params={"symbol": symbol, "interval": interval, "limit": 2},
+    )
+    now = pd.Timestamp.now(tz="UTC")
+    completed = [
+        pd.to_datetime(row[0], unit="ms", utc=True)
+        for row in data or []
+        if pd.to_datetime(row[6], unit="ms", utc=True) <= now
+    ]
+    if not completed:
+        return None
+    return str(max(completed))
+=======
     Evita descargar KLINES_LIMIT velas cuando el caché sigue vigente.
     """
     try:
@@ -165,6 +186,7 @@ def fetch_latest_completed_open_time(symbol: str, interval: str = INTERVAL) -> O
         return None
     except Exception:
         return None
+ main
 
 # ─── Indicadores ─────────────────────────────────────────────────────────────
 def rsi(series: pd.Series, length: int = 14) -> pd.Series:
@@ -246,8 +268,8 @@ def normalize_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for c in ["rsi", "wt", "cci", "adx"]:
         s  = out[c]
-        mn = s.expanding(min_periods=50).min()
-        mx = s.expanding(min_periods=50).max()
+        mn = s.expanding(min_periods=2).min()
+        mx = s.expanding(min_periods=2).max()
         out[c] = ((s - mn) / (mx - mn).replace(0, np.nan) * 2 - 1).fillna(0.0)
     return out
 
@@ -257,8 +279,8 @@ def compute_prediction(df: pd.DataFrame) -> pd.Series:
 
     # Momentum causal: expanding min/max → SIN look-ahead
     mom    = x["close"].pct_change(4).fillna(0.0)
-    mn_mom = mom.expanding(min_periods=50).min()
-    mx_mom = mom.expanding(min_periods=50).max()
+    mn_mom = mom.expanding(min_periods=2).min()
+    mx_mom = mom.expanding(min_periods=2).max()
     x["mom"] = ((mom - mn_mom) / (mx_mom - mn_mom).replace(0, np.nan) * 2 - 1).fillna(0.0)
 
     feat_cols = ["rsi", "wt", "cci", "adx", "mom"][:FEATURE_COUNT]
@@ -356,6 +378,19 @@ def backtest_tp_sl(
         sl          = entry_price - atr_v * sl_mult * mult
         entry_idx   = i
 
+    def resolve_intrabar_exit(bar_open: float, tp_price: float, sl_price: float):
+        """Resuelve velas ambiguas donde TP y SL son tocados en el mismo bar."""
+        if INTRABAR_EXIT_POLICY == "OPEN_DISTANCE":
+            tp_dist = abs(tp_price - bar_open)
+            sl_dist = abs(bar_open - sl_price)
+            if tp_dist < sl_dist:
+                return "TP", tp_price
+            if sl_dist < tp_dist:
+                return "SL", sl_price
+
+        # Empate o política CONSERVATIVE: no asumir el camino favorable.
+        return "SL", sl_price
+
     def close_pos(i: int, xprice: float, reason: str):
         nonlocal in_pos, side, entry_price, tp, sl, entry_idx
         pnl = (
@@ -396,12 +431,20 @@ def backtest_tp_sl(
             exit_reason = None
             exit_price  = None
 
+            bar_open = float(out["open"].iat[i])
             if side == "LONG":
-                if   low  <= sl: exit_reason, exit_price = "SL", sl
-                elif high >= tp: exit_reason, exit_price = "TP", tp
+                hit_sl = low <= sl
+                hit_tp = high >= tp
             else:
-                if   high >= sl: exit_reason, exit_price = "SL", sl
-                elif low  <= tp: exit_reason, exit_price = "TP", tp
+                hit_sl = high >= sl
+                hit_tp = low <= tp
+
+            if hit_sl and hit_tp:
+                exit_reason, exit_price = resolve_intrabar_exit(bar_open, tp, sl)
+            elif hit_sl:
+                exit_reason, exit_price = "SL", sl
+            elif hit_tp:
+                exit_reason, exit_price = "TP", tp
 
             # FLIP sólo si no golpeó TP/SL primero
             if is_flip and exit_reason is None:
@@ -448,7 +491,10 @@ def calculate_metrics(trades: List[Trade]) -> dict:
     losses = [t for t in closed if t.pnl_pct <= 0]
     gp     = sum(t.pnl_pct for t in wins)
     gl     = abs(sum(t.pnl_pct for t in losses))
+    pf     = float("inf") if gl == 0 else gp / gl
+=======
     pf     = gp / max(gl, 1e-9)
+
 
     eq   = float(INITIAL_BALANCE)
     peak = eq
@@ -463,7 +509,7 @@ def calculate_metrics(trades: List[Trade]) -> dict:
         avg_pnl       = round(sum(t.pnl_pct for t in closed) / len(closed), 4),
         total_pnl     = round(sum(t.pnl_pct for t in closed), 4),
         max_dd        = round(mdd, 2),
-        profit_factor = round(pf, 2),
+        profit_factor = round(pf, 2) if np.isfinite(pf) else pf,
         n             = len(closed),
     )
 
@@ -471,8 +517,12 @@ def summarize_trades(trades: List[Trade], last_n: int = RISK_PRINT_LAST_TRADES) 
     metrics  = calculate_metrics(trades)
     closed   = [t for t in trades if t.result != "OPEN"]
     last     = closed[-last_n:]
-    pnl_usd  = sum(t.pnl_pct / 100 * TRADE_NOTIONAL for t in last)
-    return dict(metrics=metrics, trades=last, pnl_usd=round(pnl_usd, 2))
+    # Estimación simple: notional fijo por trade, sin balance compuesto.
+    pnl_usd_fixed = sum(t.pnl_pct / 100 * TRADE_NOTIONAL for t in last)
+    return dict(metrics=metrics, trades=last, pnl_usd_fixed=round(pnl_usd_fixed, 2))
+
+def format_profit_factor(value: float) -> str:
+    return "INF" if np.isinf(value) else f"{value:.2f}"
 
 def format_last_trades(trades: List[Trade]) -> str:
     if not trades:
@@ -493,11 +543,20 @@ def process_symbol(symbol: str) -> Optional[dict]:
     """
     global _symbol_cache
     try:
+
+        with _cache_lock:
+            cache = _symbol_cache.get(symbol)
+        if cache:
+            last_time = fetch_latest_completed_open_time(symbol)
+            if last_time is None:
+                return dict(symbol=symbol, error="no closed kline in latest poll; cache not reused")
+=======
         cache = _symbol_cache.get(symbol)
         if cache:
             last_time = fetch_latest_completed_open_time(symbol)
             if last_time is None:
                 return cache["result"]
+ main
             if cache.get("last_time") == last_time:
                 return cache["result"]
 
@@ -526,12 +585,17 @@ def process_symbol(symbol: str) -> Optional[dict]:
             price        = float(last["close"]),
             atr_pct      = atr_pct,
             metrics      = summary["metrics"],
-            pnl_usd_5    = summary["pnl_usd"],
+            pnl_usd_5    = summary["pnl_usd_fixed"],
             last_5       = summary["trades"],
             total_trades = summary["metrics"]["n"],
             last_5_text  = format_last_trades(summary["trades"]),
         )
+
+        with _cache_lock:
+            _symbol_cache[symbol] = dict(last_time=last_time, result=result)
+=======
         _symbol_cache[symbol] = dict(last_time=last_time, result=result)
+ main
         return result
     except Exception as e:
         return dict(symbol=symbol, error=str(e))
@@ -540,8 +604,9 @@ def process_symbol(symbol: str) -> Optional[dict]:
 # ─── Ciclo de escaneo ─────────────────────────────────────────────────────────
 def scan_once(symbols: List[str]) -> List[dict]:
     results = []
+    unique_symbols = list(dict.fromkeys(symbols))
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_symbol, sym): sym for sym in symbols}
+        futures = {executor.submit(process_symbol, sym): sym for sym in unique_symbols}
         for future in as_completed(futures):
             r = future.result()
             if r is not None:
@@ -577,7 +642,8 @@ def main():
 
         signals = [r for r in results if "error" not in r and r["signal"] != "NEUTRAL"]
         errors  = [r for r in results if "error" in r]
-        cached  = sum(1 for s in symbols if _symbol_cache.get(s, {}).get("last_time"))
+        with _cache_lock:
+            cached = sum(1 for s in symbols if _symbol_cache.get(s, {}).get("last_time"))
 
         print(
             f"Listo en {elapsed:.1f}s │ {len(results)} proc │ "
@@ -595,12 +661,12 @@ def main():
                 print(
                     f"{r['symbol']:<12} {r['signal']:<7} {r['price']:<13.4f} "
                     f"{r['atr_pct']:<7.2f} {m['win_rate']:<7.1f} "
-                    f"{m['profit_factor']:<6.2f} {r['total_trades']:<5} {m['max_dd']:.2f}"
+                    f"{format_profit_factor(m['profit_factor']):<6} {r['total_trades']:<5} {m['max_dd']:.2f}"
                 )
 
             print("\nÚltimos trades (top 5 por WR):")
             for r in signals[:5]:
-                print(f"\n  {r['symbol']} [{r['signal']}]  pnl_5={r['pnl_usd_5']:+.2f} USD")
+                print(f"\n  {r['symbol']} [{r['signal']}]  pnl_5_fixed={r['pnl_usd_5']:+.2f} USD")
                 print(r["last_5_text"])
         else:
             print("Sin señales activas en este ciclo.")
