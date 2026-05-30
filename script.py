@@ -102,13 +102,19 @@ def fetch_symbol_universe() -> List[str]:
             and s.get("symbol", "").endswith("USDT")
         ]
     except Exception as e:
-        print(f"[ERROR] exchangeInfo: {e}")
+        print(f"[ERROR] fetch_symbol_universe: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Status Code: {e.response.status_code} - Reason: {e.response.reason}")
+            if e.response.status_code == 451:
+                print("Tip: Binance is restricted in your region. Consider using a VPN or a proxy.")
         return []
 
 def fetch_top_by_volume(limit: int = TOP_N) -> List[str]:
     try:
         tickers = http_get("/fapi/v1/ticker/24hr")
         allowed = set(fetch_symbol_universe())
+        if not allowed:
+            return []
         rows = [
             (t["symbol"], float(t.get("quoteVolume", 0)))
             for t in tickers if t["symbol"] in allowed
@@ -116,7 +122,9 @@ def fetch_top_by_volume(limit: int = TOP_N) -> List[str]:
         rows.sort(key=lambda x: x[1], reverse=True)
         return [s for s, _ in rows[:limit]]
     except Exception as e:
-        print(f"[ERROR] tickers: {e}")
+        print(f"[ERROR] fetch_top_by_volume: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Status Code: {e.response.status_code} - Reason: {e.response.reason}")
         return []
 
 def fetch_klines(symbol: str, interval: str = INTERVAL,
@@ -143,7 +151,10 @@ def fetch_klines(symbol: str, interval: str = INTERVAL,
         if len(df) and df.iloc[-1]["close_time"] > now:
             df = df.iloc[:-1].copy()
         return df.reset_index(drop=True)
-    except Exception:
+    except Exception as e:
+        print(f"[ERROR] fetch_klines({symbol}): {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Status Code: {e.response.status_code} - Body: {e.response.text}")
         return pd.DataFrame()
 
 # ─── Indicadores ─────────────────────────────────────────────────────────────
