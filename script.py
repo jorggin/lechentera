@@ -170,6 +170,23 @@ def fetch_latest_completed_open_time(symbol: str, interval: str = INTERVAL) -> O
     if not completed:
         return None
     return str(max(completed))
+=======
+    Evita descargar KLINES_LIMIT velas cuando el caché sigue vigente.
+    """
+    try:
+        data = http_get(
+            "/fapi/v1/klines",
+            params={"symbol": symbol, "interval": interval, "limit": 2},
+        )
+        now = pd.Timestamp.now(tz="UTC")
+        for row in reversed(data or []):
+            close_time = pd.to_datetime(row[6], unit="ms", utc=True)
+            if close_time <= now:
+                return str(pd.to_datetime(row[0], unit="ms", utc=True))
+        return None
+    except Exception:
+        return None
+ main
 
 # ─── Indicadores ─────────────────────────────────────────────────────────────
 def rsi(series: pd.Series, length: int = 14) -> pd.Series:
@@ -475,6 +492,9 @@ def calculate_metrics(trades: List[Trade]) -> dict:
     gp     = sum(t.pnl_pct for t in wins)
     gl     = abs(sum(t.pnl_pct for t in losses))
     pf     = float("inf") if gl == 0 else gp / gl
+=======
+    pf     = gp / max(gl, 1e-9)
+
 
     eq   = float(INITIAL_BALANCE)
     peak = eq
@@ -523,12 +543,20 @@ def process_symbol(symbol: str) -> Optional[dict]:
     """
     global _symbol_cache
     try:
+
         with _cache_lock:
             cache = _symbol_cache.get(symbol)
         if cache:
             last_time = fetch_latest_completed_open_time(symbol)
             if last_time is None:
                 return dict(symbol=symbol, error="no closed kline in latest poll; cache not reused")
+=======
+        cache = _symbol_cache.get(symbol)
+        if cache:
+            last_time = fetch_latest_completed_open_time(symbol)
+            if last_time is None:
+                return cache["result"]
+ main
             if cache.get("last_time") == last_time:
                 return cache["result"]
 
@@ -562,8 +590,12 @@ def process_symbol(symbol: str) -> Optional[dict]:
             total_trades = summary["metrics"]["n"],
             last_5_text  = format_last_trades(summary["trades"]),
         )
+
         with _cache_lock:
             _symbol_cache[symbol] = dict(last_time=last_time, result=result)
+=======
+        _symbol_cache[symbol] = dict(last_time=last_time, result=result)
+ main
         return result
     except Exception as e:
         return dict(symbol=symbol, error=str(e))
